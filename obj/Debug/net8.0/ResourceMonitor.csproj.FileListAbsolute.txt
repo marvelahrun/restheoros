@@ -28,3 +28,4 @@ D:\MarvelAhrun\Projects\Resource-Monitor\obj\Debug\net8.0\refint\ResourceMonitor
 D:\MarvelAhrun\Projects\Resource-Monitor\obj\Debug\net8.0\ResourceMonitor.pdb
 D:\MarvelAhrun\Projects\Resource-Monitor\obj\Debug\net8.0\ResourceMonitor.genruntimeconfig.cache
 D:\MarvelAhrun\Projects\Resource-Monitor\obj\Debug\net8.0\ref\ResourceMonitor.dll
+D:\MarvelAhrun\Projects\Resource-Monitor\obj\Debug\net8.0\ResourceMonitor.sourcelink.json

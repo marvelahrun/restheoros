@@ -7,17 +7,33 @@ using System.Management;
 using System.Threading;
 using Spectre.Console;
 using System.Globalization;
+using LibreHardwareMonitor.Hardware;
 
 class Program
 {
     static void Main(string[] args)
     {
-        // Warm-up CPU counter
+        // Initialize LibreHardwareMonitor
+        Computer computer = new Computer
+        {
+            IsCpuEnabled = true,
+            IsGpuEnabled = true,
+            IsMemoryEnabled = true,
+            IsMotherboardEnabled = true,
+            IsControllerEnabled = false,
+            IsNetworkEnabled = false,
+            IsStorageEnabled = false
+        };
+
+        computer.Open();
+
+        // Warm-up CPU counter for fallback
         var cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
         cpuCounter.NextValue();
 
         Console.CancelKeyPress += (_, e) =>
         {
+            computer.Close();
             Console.CursorVisible = true;
             e.Cancel = false;
         };
@@ -29,19 +45,21 @@ class Program
         {
             if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Q) break;
 
-            // Gather data
-            float cpuUsage = SafeCpuUsage(cpuCounter);
-            double cpuFreq = GetCpuCurrentClockSpeedMHz(); // MHz
-            var (memUsed, memTotal) = GetMemoryUsageGB();
-            int? battery = GetBatteryPercent(); // null if not available
+            // Update hardware sensors
+            foreach (var hardware in computer.Hardware)
+            {
+                hardware.Update();
+                foreach (var subhardware in hardware.SubHardware)
+                {
+                    subhardware.Update();
+                }
+            }
 
-            // CPU sensors (may be unavailable on many systems)
-            string cpuTemp = TryGetCpuTemperatureString();
-            string cpuPower = TryGetCpuPowerString();
-            string cpuFan = TryGetCpuFanString();
-
-            // GPU (NVIDIA via nvidia-smi); returns N/A if not present
-            var gpu = GetNvidiaSmiInfo();
+            // Gather data from LibreHardwareMonitor
+            var cpuData = GetCpuData(computer);
+            var gpuData = GetGpuData(computer);
+            var memData = GetMemoryData(computer);
+            int? battery = GetBatteryPercent();
 
             // FPS placeholder (integrate PresentMon or RTSS later)
             string fps = "N/A";
@@ -52,72 +70,189 @@ class Program
             AnsiConsole.MarkupLine($"[yellow]FPS:[/] {fps}    [green]Battery:[/] {(battery.HasValue ? battery.Value + "%" : "N/A")}");
             AnsiConsole.MarkupLine("─────────────────────────────────────────────────────────────────────────────");
 
-            AnsiConsole.MarkupLine($"[bold]CPU:[/] {cpuUsage,5:F1}%  | {cpuFreq,6:F0} MHz | Temp: {cpuTemp} | Power: {cpuPower} | Fan: {cpuFan}");
-            AnsiConsole.MarkupLine($"[bold]GPU:[/] {gpu.Usage} | {gpu.ClockMHz} MHz | Temp: {gpu.Temp} | Power: {gpu.Power} | Fan: {gpu.Fan}");
+            AnsiConsole.MarkupLine($"[bold]CPU:[/] {cpuData.Usage,5:F1}%  | {cpuData.Clock,6:F0} MHz | Temp: {cpuData.Temp} | Power: {cpuData.Power} | Fan: {cpuData.Fan}");
+            AnsiConsole.MarkupLine($"[bold]GPU:[/] {gpuData.Usage} | {gpuData.Clock} | Temp: {gpuData.Temp} | Power: {gpuData.Power} | Fan: {gpuData.Fan}");
             AnsiConsole.MarkupLine("─────────────────────────────────────────────────────────────────────────────");
-            AnsiConsole.MarkupLine($"[bold]Memory:[/] {memUsed:F1} / {memTotal:F1} GB");
-            AnsiConsole.MarkupLine($"[bold]VRAM:[/] {gpu.VramUsage} | VRAM Used: {gpu.VramUsed} / {gpu.VramTotal}");
+            AnsiConsole.MarkupLine($"[bold]Memory:[/] {memData.Used:F1} / {memData.Total:F1} GB ({memData.UsagePercent:F1}%)");
+            AnsiConsole.MarkupLine($"[bold]VRAM:[/] {gpuData.VramUsage} | VRAM Used: {gpuData.VramUsed} / {gpuData.VramTotal}");
             AnsiConsole.MarkupLine("─────────────────────────────────────────────────────────────────────────────");
             AnsiConsole.MarkupLine("[grey]Press Q to quit[/]");
 
             Thread.Sleep(refreshMs);
         }
 
+        computer.Close();
         Console.CursorVisible = true;
     }
 
-    // CPU usage safe (non-blocking)
-    static float SafeCpuUsage(PerformanceCounter cpuCounter)
+    class CpuData
     {
-        try
-        {
-            // Using a warmed-up counter: NextValue is instantaneous here
-            return cpuCounter.NextValue();
-        }
-        catch
-        {
-            return 0f;
-        }
+        public float Usage;
+        public double Clock;
+        public string Temp = "N/A";
+        public string Power = "N/A";
+        public string Fan = "N/A";
     }
 
-    // CPU current clock speed (MHz) via WMI (Win32_Processor.CurrentClockSpeed)
-    static double GetCpuCurrentClockSpeedMHz()
+    static CpuData GetCpuData(Computer computer)
     {
-        try
+        var data = new CpuData();
+        
+        foreach (var hardware in computer.Hardware)
         {
-            using var searcher = new ManagementObjectSearcher("SELECT CurrentClockSpeed FROM Win32_Processor");
-            foreach (ManagementObject mo in searcher.Get())
+            if (hardware.HardwareType == HardwareType.Cpu)
             {
-                var val = mo["CurrentClockSpeed"];
-                if (val != null && double.TryParse(val.ToString(), out double mhz))
-                    return mhz;
+                foreach (var sensor in hardware.Sensors)
+                {
+                    if (sensor.SensorType == SensorType.Load && sensor.Name.Contains("Total"))
+                    {
+                        data.Usage = sensor.Value ?? 0f;
+                    }
+                    else if (sensor.SensorType == SensorType.Clock && sensor.Name.Contains("Core #1"))
+                    {
+                        data.Clock = sensor.Value ?? 0f;
+                    }
+                    else if (sensor.SensorType == SensorType.Temperature && (sensor.Name.Contains("Package") || sensor.Name.Contains("Core Average")))
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Temp = $"{sensor.Value:F1}°C";
+                    }
+                    else if (sensor.SensorType == SensorType.Power && sensor.Name.Contains("Package"))
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Power = $"{sensor.Value:F1} W";
+                    }
+                    else if (sensor.SensorType == SensorType.Fan)
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Fan = $"{sensor.Value:F0} RPM";
+                    }
+                }
             }
         }
-        catch { }
-        return double.NaN;
+
+        return data;
     }
 
-    // Memory usage via WMI (returns usedGB, totalGB)
-    static (double used, double total) GetMemoryUsageGB()
+    class GpuData
     {
-        try
-        {
-            ulong totalMemory = 0, freeMemory = 0;
-            using var searcher = new ManagementObjectSearcher("SELECT TotalVisibleMemorySize, FreePhysicalMemory FROM Win32_OperatingSystem");
-            foreach (ManagementObject obj in searcher.Get())
-            {
-                totalMemory = (ulong)obj["TotalVisibleMemorySize"];
-                freeMemory = (ulong)obj["FreePhysicalMemory"];
-            }
+        public string Usage = "N/A";
+        public string Clock = "N/A";
+        public string Temp = "N/A";
+        public string Power = "N/A";
+        public string Fan = "N/A";
+        public string VramUsage = "N/A";
+        public string VramUsed = "N/A";
+        public string VramTotal = "N/A";
+    }
 
-            double totalGB = totalMemory / 1024.0 / 1024.0;
-            double usedGB = (totalMemory - freeMemory) / 1024.0 / 1024.0;
-            return (usedGB, totalGB);
-        }
-        catch
+    static GpuData GetGpuData(Computer computer)
+    {
+        var data = new GpuData();
+        
+        foreach (var hardware in computer.Hardware)
         {
-            return (0, 0);
+            if (hardware.HardwareType == HardwareType.GpuNvidia || 
+                hardware.HardwareType == HardwareType.GpuAmd || 
+                hardware.HardwareType == HardwareType.GpuIntel)
+            {
+                double memUsed = 0, memTotal = 0;
+                
+                foreach (var sensor in hardware.Sensors)
+                {
+                    if (sensor.SensorType == SensorType.Load && sensor.Name.Contains("Core"))
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Usage = $"{sensor.Value:F1}%";
+                    }
+                    else if (sensor.SensorType == SensorType.Clock && sensor.Name.Contains("Core"))
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Clock = $"{sensor.Value:F0} MHz";
+                    }
+                    else if (sensor.SensorType == SensorType.Temperature && sensor.Name.Contains("Core"))
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Temp = $"{sensor.Value:F1}°C";
+                    }
+                    else if (sensor.SensorType == SensorType.Power && (sensor.Name.Contains("Package") || sensor.Name.Contains("Total")))
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Power = $"{sensor.Value:F1} W";
+                    }
+                    else if (sensor.SensorType == SensorType.Fan)
+                    {
+                        if (sensor.Value.HasValue)
+                            data.Fan = $"{sensor.Value:F0}%";
+                    }
+                    else if (sensor.SensorType == SensorType.SmallData && sensor.Name.Contains("Memory Used"))
+                    {
+                        memUsed = sensor.Value ?? 0;
+                        data.VramUsed = $"{memUsed / 1024:F1} GB";
+                    }
+                    else if (sensor.SensorType == SensorType.SmallData && sensor.Name.Contains("Memory Total"))
+                    {
+                        memTotal = sensor.Value ?? 0;
+                        data.VramTotal = $"{memTotal / 1024:F1} GB";
+                    }
+                    else if (sensor.SensorType == SensorType.Load && sensor.Name.Contains("Memory"))
+                    {
+                        if (sensor.Value.HasValue)
+                            data.VramUsage = $"{sensor.Value:F1}%";
+                    }
+                }
+
+                // Calculate VRAM usage if not directly available
+                if (data.VramUsage == "N/A" && memTotal > 0)
+                {
+                    double pct = (memUsed / memTotal) * 100.0;
+                    data.VramUsage = $"{pct:F1}%";
+                }
+                
+                break; // Use first GPU found
+            }
         }
+
+        return data;
+    }
+
+    class MemData
+    {
+        public double Used;
+        public double Total;
+        public double UsagePercent;
+    }
+
+    static MemData GetMemoryData(Computer computer)
+    {
+        var data = new MemData();
+        
+        foreach (var hardware in computer.Hardware)
+        {
+            if (hardware.HardwareType == HardwareType.Memory)
+            {
+                foreach (var sensor in hardware.Sensors)
+                {
+                    if (sensor.SensorType == SensorType.Data && sensor.Name.Contains("Used"))
+                    {
+                        data.Used = sensor.Value ?? 0;
+                    }
+                    else if (sensor.SensorType == SensorType.Data && sensor.Name.Contains("Available"))
+                    {
+                        double available = sensor.Value ?? 0;
+                        // Total is typically calculated from Used + Available
+                        if (data.Used > 0)
+                            data.Total = data.Used + available;
+                    }
+                    else if (sensor.SensorType == SensorType.Load && sensor.Name.Contains("Memory"))
+                    {
+                        data.UsagePercent = sensor.Value ?? 0;
+                    }
+                }
+            }
+        }
+
+        return data;
     }
 
     // Battery percent via WMI (Win32_Battery) -- may be absent on desktops
@@ -135,132 +270,5 @@ class Program
         }
         catch { }
         return null;
-    }
-
-    // CPU temperature reading attempt (MSAcpi_ThermalZoneTemperature or Win32_TemperatureProbe)
-    // Note: most modern Windows desktops/boards don't expose CPU temp via these WMI classes.
-    static string TryGetCpuTemperatureString()
-    {
-        try
-        {
-            // MSAcpi_ThermalZoneTemperature returns tenths of Kelvin on some systems
-            using var searcher = new ManagementObjectSearcher("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature");
-            foreach (ManagementObject mo in searcher.Get())
-            {
-                var cur = mo["CurrentTemperature"];
-                if (cur != null && double.TryParse(cur.ToString(), out double t))
-                {
-                    // convert tenths of Kelvin to Celsius if necessary
-                    double c = (t / 10.0) - 273.15;
-                    return $"{c:F1}°C";
-                }
-            }
-        }
-        catch { }
-
-        // fallback attempt: Win32_TemperatureProbe (rarely present)
-        try
-        {
-            using var searcher = new ManagementObjectSearcher("SELECT CurrentReading FROM Win32_TemperatureProbe");
-            foreach (ManagementObject mo in searcher.Get())
-            {
-                var cur = mo["CurrentReading"];
-                if (cur != null && double.TryParse(cur.ToString(), out double r))
-                {
-                    // Not standardized; present raw
-                    return $"{r:F1}";
-                }
-            }
-        }
-        catch { }
-
-        return "N/A";
-    }
-
-    static string TryGetCpuPowerString()
-    {
-        // No standard cross-vendor WMI for CPU power draw; usually requires vendor tools or LibreHardwareMonitor.
-        return "N/A";
-    }
-
-    static string TryGetCpuFanString()
-    {
-        // Fan speed typically not exposed via standard WMI.
-        return "N/A";
-    }
-
-    // ---------------------------
-    // NVIDIA GPU via nvidia-smi
-    // ---------------------------
-    class NvidiaInfo
-    {
-        public string Usage = "N/A";
-        public string Temp = "N/A";
-        public string Power = "N/A";
-        public string VramUsage = "N/A";
-        public string VramUsed = "N/A";
-        public string VramTotal = "N/A";
-        public string ClockMHz = "N/A";
-        public string Fan = "N/A";
-    }
-
-    static NvidiaInfo GetNvidiaSmiInfo()
-    {
-        // If nvidia-smi is not on PATH or not installed, return N/A object.
-        try
-        {
-            // Query fields: temp, gpu utilization, power draw, memory.used, memory.total, fan speed, clocks
-            // Some fields may not be available depending on driver version.
-            string args = "--query-gpu=temperature.gpu,utilization.gpu,power.draw,memory.used,memory.total,fan.speed,clocks.gr --format=csv,noheader,nounits";
-            var psi = new ProcessStartInfo("nvidia-smi", args)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var proc = Process.Start(psi);
-            if (proc == null) return new NvidiaInfo();
-            string output = proc.StandardOutput.ReadToEnd().Trim();
-            string err = proc.StandardError.ReadToEnd().Trim();
-            proc.WaitForExit(500);
-
-            if (string.IsNullOrWhiteSpace(output))
-            {
-                return new NvidiaInfo();
-            }
-
-            // For systems with multiple GPUs, nvidia-smi returns multiple lines.
-            // We'll take the first GPU (line 0).
-            var firstLine = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-            if (string.IsNullOrWhiteSpace(firstLine)) return new NvidiaInfo();
-
-            // CSV: temp, utilization, power, mem.used, mem.total, fan.speed, clocks.gr
-            var parts = firstLine.Split(',').Select(p => p.Trim()).ToArray();
-            var info = new NvidiaInfo();
-
-            if (parts.Length >= 1) info.Temp = parts[0] + "°C";
-            if (parts.Length >= 2) info.Usage = parts[1] + "%";
-            if (parts.Length >= 3) info.Power = parts[2] + " W";
-            if (parts.Length >= 4) info.VramUsed = parts[3] + " MiB";
-            if (parts.Length >= 5) info.VramTotal = parts[4] + " MiB";
-            if (parts.Length >= 6) info.Fan = parts[5] + " %";
-            if (parts.Length >= 7) info.ClockMHz = parts[6] + " MHz";
-
-            // compute VRAM usage percent if possible
-            if (parts.Length >= 5 && double.TryParse(parts[3], NumberStyles.Any, CultureInfo.InvariantCulture, out double used) &&
-                double.TryParse(parts[4], NumberStyles.Any, CultureInfo.InvariantCulture, out double total))
-            {
-                double pct = total > 0 ? used / total * 100.0 : 0;
-                info.VramUsage = $"{pct:F0}%";
-            }
-
-            return info;
-        }
-        catch
-        {
-            return new NvidiaInfo();
-        }
     }
 }
